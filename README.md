@@ -38,6 +38,8 @@ hidden pool: ture
 parent pool id: 1
 ~~~
 
+If you would like to test with static micro-sliced cores (by the static-usliced-cores branch), then you need to manually configure the number of processors in the `Hidden-node`.  
+
  # Authors
  * Jeongseob Ahn
  * Chang Hyun Park
