@@ -751,6 +751,8 @@ int arch_set_info_guest(
     v->arch.ttbcr = ctxt->ttbcr;
 
     v->is_initialised = 1;
+    v->need_boost = 0;
+    v->yielded = 0;
 
     if ( ctxt->flags & VGCF_online )
         clear_bit(_VPF_down, &v->pause_flags);

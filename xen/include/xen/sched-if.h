@@ -12,6 +12,8 @@
 
 /* A global pointer to the initial cpupool (POOL0). */
 extern struct cpupool *cpupool0;
+extern struct cpupool *hidden_cpupool;
+extern cpumask_t hidden_locked_cpus;
 
 /* cpus currently in no cpupool */
 extern cpumask_t cpupool_free_cpus;
@@ -172,6 +174,11 @@ struct scheduler {
 
     void         (*tick_suspend)    (const struct scheduler *, unsigned int);
     void         (*tick_resume)     (const struct scheduler *, unsigned int);
+
+    struct vcpu * (*curr_vcpu)      (const struct scheduler *, int);
+    int          (*get_priority)    (const struct scheduler *, struct vcpu *);
+    int          (*is_yield)        (const struct scheduler *, struct vcpu *);
+    int          (*check_runq)      (const struct scheduler *, int);
 };
 
 #define REGISTER_SCHEDULER(x) static const struct scheduler *x##_entry \
@@ -186,6 +193,7 @@ struct cpupool
     unsigned int     n_dom;
     struct scheduler *sched;
     atomic_t         refcnt;
+    uint8_t          is_hidden;
 };
 
 #define cpupool_online_cpumask(_pool) \

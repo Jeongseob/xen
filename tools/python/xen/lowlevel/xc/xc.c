@@ -1726,7 +1726,7 @@ static PyObject *pyxc_cpupool_create(XcObject *self,
                                       &sched))
         return NULL;
 
-    if ( xc_cpupool_create(self->xc_handle, &cpupool, sched) < 0 )
+    if ( xc_cpupool_create(self->xc_handle, &cpupool, sched, 0, 0) < 0 )
         return pyxc_error_to_exception(self->xc_handle);
 
     return PyInt_FromLong(cpupool);

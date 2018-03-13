@@ -426,6 +426,8 @@ struct cmd_spec cmd_table[] = {
       "Create a new CPU pool",
       "[options] [<ConfigFile>] [Variable=value ...]",
       "-h, --help                   Print this help.\n"
+      "-s, --hiddenpool             Set this pool as a hidden pool.\n"
+      "-t PARENT POOLID, --parentid Set the parent poolid \n"
       "-f FILE, --defconfig=FILE    Use the given configuration file.\n"
       "-n, --dryrun                 Dry run - prints the resulting configuration.\n"
       "                              (deprecated in favour of global -N option).\n"

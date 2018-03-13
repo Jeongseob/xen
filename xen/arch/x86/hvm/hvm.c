@@ -1190,6 +1190,8 @@ static int hvm_load_cpu_ctxt(struct domain *d, hvm_domain_context_t *h)
 
     /* Auxiliary processors should be woken immediately. */
     v->is_initialised = 1;
+    v->need_boost = 0;
+    v->yielded = 0;
     clear_bit(_VPF_down, &v->pause_flags);
     vcpu_wake(v);
 
@@ -4485,6 +4487,8 @@ void hvm_vcpu_reset_state(struct vcpu *v, uint16_t cs, uint16_t ip)
 
     v->arch.flags |= TF_kernel_mode;
     v->is_initialised = 1;
+    v->need_boost = 0;
+    v->yielded = 0;
     clear_bit(_VPF_down, &v->pause_flags);
 
  out:

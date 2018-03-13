@@ -28,6 +28,9 @@
 #include <public/vm_event.h>
 #include <public/event_channel.h>
 
+#define URGENT_IPI      1
+#define URGENT_KERNEL   2
+
 #ifdef CONFIG_COMPAT
 #include <compat/vcpu.h>
 DEFINE_XEN_GUEST_HANDLE(vcpu_runstate_info_compat_t);
@@ -144,6 +147,7 @@ struct vcpu
     int              vcpu_id;
 
     int              processor;
+    int              prev_processor; /* remember the previously running cpu */
 
     vcpu_info_t     *vcpu_info;
 
@@ -185,6 +189,10 @@ struct vcpu
     bool_t           is_running;
     /* VCPU should wake fast (do not deep sleep the CPU). */
     bool_t           is_urgent;
+    /* VCPU should run on a hidden cpu */
+    int              need_boost;
+    /* Has the VCPU been yilded? */
+    bool_t           yielded;
 
 #ifdef VCPU_TRAP_LAST
 #define VCPU_TRAP_NONE    0
@@ -473,6 +481,11 @@ struct domain
         unsigned int guest_request_enabled       : 1;
         unsigned int guest_request_sync          : 1;
     } monitor;
+
+    /* used for offloading vcpu siblings to hidden cpus */
+    spinlock_t offload_lock;
+    bool_t on_offloading;
+
 };
 
 /* Protect updates/reads (resp.) of domain_list and domain_hash. */

@@ -7983,6 +7983,8 @@ int main_cpupoolcreate(int argc, char **argv)
     static struct option opts[] = {
         {"defconfig", 1, 0, 'f'},
         {"dryrun", 0, 0, 'n'},
+        {"hiddenpool", 0, 0, 's'},
+        {"parentid", 0, 0, 't'},
         COMMON_LONG_OPTS
     };
     int ret;
@@ -7992,6 +7994,8 @@ int main_cpupoolcreate(int argc, char **argv)
     const char *buf;
     char *name = NULL;
     uint32_t poolid;
+    bool is_hidden_pool = false;
+    int parent_poolid = 0;
     libxl_scheduler sched = 0;
     XLU_ConfigList *cpus;
     XLU_ConfigList *nodes;
@@ -8002,12 +8006,18 @@ int main_cpupoolcreate(int argc, char **argv)
     libxl_cputopology *topology;
     int rc = EXIT_FAILURE;
 
-    SWITCH_FOREACH_OPT(opt, "nf:", opts, "cpupool-create", 0) {
+    SWITCH_FOREACH_OPT(opt, "nf:st:", opts, "cpupool-create", 0) {
     case 'f':
         filename = optarg;
         break;
     case 'n':
         dryrun_only = 1;
+        break;
+    case 's':
+        is_hidden_pool = true;
+        break;
+    case 't':
+        parent_poolid = atoi(optarg);
         break;
     }
 
@@ -8163,10 +8173,12 @@ int main_cpupoolcreate(int argc, char **argv)
     printf("cpupool name:   %s\n", name);
     printf("scheduler:      %s\n", libxl_scheduler_to_string(sched));
     printf("number of cpus: %d\n", n_cpus);
+    printf("hidden pool: %s\n", is_hidden_pool ? "ture" : "false");
+    printf("parent pool id: %d\n", parent_poolid);
 
     if (!dryrun_only) {
         poolid = 0;
-        if (libxl_cpupool_create(ctx, name, sched, cpumap, &uuid, &poolid)) {
+        if (libxl_cpupool_create(ctx, name, sched, cpumap, &uuid, &poolid, is_hidden_pool ? 1 : 0, parent_poolid)) {
             fprintf(stderr, "error on creating cpupool\n");
             goto out_cfg;
         }
@@ -8537,7 +8549,7 @@ int main_cpupoolnumasplit(int argc, char **argv)
         xasprintf(&name, "Pool-node%d", node);
         libxl_uuid_generate(&uuid);
         poolid = 0;
-        if (libxl_cpupool_create(ctx, name, sched, cpumap, &uuid, &poolid)) {
+        if (libxl_cpupool_create(ctx, name, sched, cpumap, &uuid, &poolid, 0, 0)) {
             fprintf(stderr, "error on creating cpupool\n");
             goto out;
         }

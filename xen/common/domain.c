@@ -268,6 +268,8 @@ struct domain *domain_create(domid_t domid, unsigned int domcr_flags,
     if ( (d = alloc_domain_struct()) == NULL )
         return ERR_PTR(-ENOMEM);
 
+    spin_lock_init(&d->offload_lock);
+    d->on_offloading = 0;
     d->domain_id = domid;
 
     TRACE_1D(TRC_DOM0_DOM_ADD, d->domain_id);
@@ -1109,6 +1111,9 @@ int vcpu_reset(struct vcpu *v)
     v->fpu_initialised = 0;
     v->fpu_dirtied     = 0;
     v->is_initialised  = 0;
+    v->need_boost      = 0;
+    v->yielded         = 0;
+
 #ifdef VCPU_TRAP_LAST
     v->async_exception_mask = 0;
     memset(v->async_exception_state, 0, sizeof(v->async_exception_state));

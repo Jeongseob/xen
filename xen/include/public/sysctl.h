@@ -555,6 +555,8 @@ struct xen_sysctl_cpupool_op {
     uint32_t cpu;         /* IN: AR             */
     uint32_t n_dom;       /*            OUT: I  */
     struct xenctl_bitmap cpumap; /*     OUT: IF */
+    uint8_t is_hidden;    /* IN: C */
+    uint32_t parent_poolid;    /* IN: C */
 };
 typedef struct xen_sysctl_cpupool_op xen_sysctl_cpupool_op_t;
 DEFINE_XEN_GUEST_HANDLE(xen_sysctl_cpupool_op_t);

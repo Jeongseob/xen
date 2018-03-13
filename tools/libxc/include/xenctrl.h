@@ -1055,7 +1055,10 @@ typedef struct xc_cpupoolinfo {
  */
 int xc_cpupool_create(xc_interface *xch,
                       uint32_t *ppoolid,
-                      uint32_t sched_id);
+                      uint32_t sched_id,
+                      uint8_t is_hidden,
+                      uint32_t parent_poolid);
+
 
 /**
  * Destroy a cpupool. Pool must be unused and have no cpu assigned.

@@ -39,6 +39,7 @@
 #include <xsm/xsm.h>
 #include <xen/err.h>
 
+cpumask_t hidden_locked_cpus;
 /* opt_sched: scheduler - default to configured value */
 static char __initdata opt_sched[10] = CONFIG_SCHED_DEFAULT;
 string_param("sched", opt_sched);
@@ -231,6 +232,7 @@ int sched_init_vcpu(struct vcpu *v, unsigned int processor)
      * domain-0 VCPUs, are pinned onto their respective physical CPUs.
      */
     v->processor = processor;
+    v->prev_processor = processor;
     if ( is_idle_domain(d) || d->is_pinned )
         cpumask_copy(v->cpu_hard_affinity, cpumask_of(processor));
     else
@@ -494,7 +496,10 @@ static void vcpu_move_locked(struct vcpu *v, unsigned int new_cpu)
     if ( VCPU2OP(v)->migrate )
         SCHED_OP(VCPU2OP(v), migrate, v, new_cpu);
     else
+    {
+        v->prev_processor = old_cpu;
         v->processor = new_cpu;
+    }
 }
 
 /*
@@ -597,6 +602,50 @@ static void vcpu_migrate(struct vcpu *v)
 
     /* Wake on new CPU. */
     vcpu_wake(v);
+}
+
+/*
+ * It is basically the same as 'vcpu_migrate' except for migrating the vcpu to a designated pcpu
+ */
+static int vcpu_migrate_to_cpu(struct vcpu *v, int pcpu, int boost)
+{
+    unsigned long flags;
+    int old_cpu, new_cpu;
+    spinlock_t *old_lock, *new_lock;
+
+    old_cpu = v->processor;
+    new_cpu = pcpu;
+
+    ASSERT(old_cpu != new_cpu);
+
+    old_lock = per_cpu(schedule_data, old_cpu).schedule_lock;
+    new_lock = per_cpu(schedule_data, new_cpu).schedule_lock;
+
+    sched_spin_lock_double(old_lock, new_lock, &flags);
+
+    /*
+     * NB. Check of v->running happens /after/ setting migration flag
+     * because they both happen in (different) spinlock regions, and those
+     * regions are strictly serialised.
+     */
+    if ( v->is_running ||
+         !test_and_clear_bit(_VPF_migrating, &v->pause_flags) )
+    {
+        sched_spin_unlock_double(old_lock, new_lock, flags);
+        return 0;
+    }
+
+    vcpu_move_locked(v, new_cpu);
+    v->need_boost = boost;
+    sched_spin_unlock_double(old_lock, new_lock, flags);
+
+    if ( old_cpu != new_cpu )
+        sched_move_irqs(v);
+
+    /* Wake on new CPU. */
+    vcpu_wake(v);
+
+    return 1;
 }
 
 /*
@@ -927,17 +976,309 @@ static long do_poll(struct sched_poll *sched_poll)
     return rc;
 }
 
+static inline int is_guest_kernel(struct vcpu *v)
+{
+    return v->arch.user_regs.rip > 0xffffffff81000000 ? 1 : 0;
+}
+
+static inline int is_vcpu_halted(struct vcpu *v)
+{
+    /* native_save_halt */
+    return v->arch.user_regs.rip == 0xffffffff81061376 ? 1 : 0;
+}
+
+static inline int is_urgent_kernel(struct vcpu *v)
+{
+    if ( is_guest_kernel(v) )
+    {
+        if ( v->arch.user_regs.rip == 0xffffffff810013a8        /* xen_hypervcall_vcpu_op */
+             || v->arch.user_regs.rip == 0xffffffff81001408     /* xen_hypercall_event_channel_op */
+             || (v->arch.user_regs.rip >= 0xffffffff810c5040 && v->arch.user_regs.rip < 0xffffffff810c5130) // __pv_queued_spin_unlock
+             || (v->arch.user_regs.rip >= 0xffffffff810c4bf0 && v->arch.user_regs.rip < 0xffffffff810c4c10) // __raw_calle_save___pv_queued_spin_unlock
+             || (v->arch.user_regs.rip >= 0xffffffff811bc2f0 && v->arch.user_regs.rip < 0xffffffff811bc300) // __raw_spin_unlock
+             || (v->arch.user_regs.rip >= 0xffffffff8107e7f0 && v->arch.user_regs.rip < 0xffffffff8107e820) // __raw_spin_unlock, __raw_spin_unlock_irq
+             || (v->arch.user_regs.rip >= 0xffffffff81186890 && v->arch.user_regs.rip < 0xffffffff811868a0) // __raw_spin_unlock
+             || (v->arch.user_regs.rip >= 0xffffffff811f9a3f && v->arch.user_regs.rip < 0xffffffff811f9a4c) // __raw_spin_unlock
+             || (v->arch.user_regs.rip >= 0xffffffff81750060 && v->arch.user_regs.rip < 0xffffffff81750070) // __raw_spin_unlock
+             || (v->arch.user_regs.rip >= 0xffffffff817f6950 && v->arch.user_regs.rip < 0xffffffff817f6970) // _raw_spin_unlock_irqrestore
+             || (v->arch.user_regs.rip >= 0xffffffff817f69b0 && v->arch.user_regs.rip < 0xffffffff817f69d0) // _raw_spin_unlock_bh
+             || (v->arch.user_regs.rip >= 0xffffffff810c4930 && v->arch.user_regs.rip < 0xffffffff810c4990) // osq_unlock
+             || (v->arch.user_regs.rip >= 0xffffffff810c5ef0 && v->arch.user_regs.rip < 0xffffffff810c60e0) // __rwsem_do_wake, rwsem_wake
+             /* TLB shootdown IPI related functions */
+             || (v->arch.user_regs.rip >= 0xffffffff8106e980 && v->arch.user_regs.rip < 0xffffffff8106ef90) // flush_tlb
+             || (v->arch.user_regs.rip >= 0xffffffff810fc6e0 && v->arch.user_regs.rip < 0xffffffff810fc740) // generic_smp_call_function_single_interrupt
+             || (v->arch.user_regs.rip >= 0xffffffff810fbd10 && v->arch.user_regs.rip < 0xffffffff810fbe40) // flush_smp_call_function_queue
+             || (v->arch.user_regs.rip >= 0xffffffff8106e8a0 && v->arch.user_regs.rip < 0xffffffff8106e980) // leave_mm
+             /* Reschedule IPI related functions */
+             || (v->arch.user_regs.rip >= 0xffffffff810a5a50 && v->arch.user_regs.rip < 0xffffffff810a5b20) // resched_curr
+             || (v->arch.user_regs.rip >= 0xffffffff810a5d50 && v->arch.user_regs.rip < 0xffffffff810a5dc0) // resched_cpu
+             || (v->arch.user_regs.rip >= 0xffffffff8109fd50 && v->arch.user_regs.rip < 0xffffffff8109fda0) // kick_process
+             || (v->arch.user_regs.rip >= 0xffffffff8102ab00 && v->arch.user_regs.rip < 0xffffffff8102ab20) // xen_reschedule_interrupt
+             || (v->arch.user_regs.rip >= 0xffffffff810a7c60 && v->arch.user_regs.rip < 0xffffffff810a7db0) // scheduler_ipi
+             || (v->arch.user_regs.rip >= 0xffffffff810a7870 && v->arch.user_regs.rip < 0xffffffff810a78d0) // sched_ttwu_pending
+             || (v->arch.user_regs.rip >= 0xffffffff810a6670 && v->arch.user_regs.rip < 0xffffffff810a66e0) // ttwu_do_activate
+             || (v->arch.user_regs.rip >= 0xffffffff810a64c0 && v->arch.user_regs.rip < 0xffffffff810a6630) // check_preempt_curr, ttwu_do_wakeup
+             /* Interrupt handling related functions */
+             || (v->arch.user_regs.rip >= 0xffffffff81082160 && v->arch.user_regs.rip < 0xffffffff81082260) // irq_enter, irq_exit
+             || (v->arch.user_regs.rip >= 0xffffffff814aea70 && v->arch.user_regs.rip < 0xffffffff814aec10) // evtchn_fifo_handle_events
+             || (v->arch.user_regs.rip >= 0xffffffff810d7f50 && v->arch.user_regs.rip < 0xffffffff810d7fa0) // handle_percpu_irq
+             || (v->arch.user_regs.rip >= 0xffffffff814ad8d0 && v->arch.user_regs.rip < 0xffffffff814ad980) // xen_send_IPI_one, xen_evtchn_do_upcall
+             || (v->arch.user_regs.rip >= 0xffffffff8102a4f0 && v->arch.user_regs.rip < 0xffffffff8102a560) // xen_smp_send_reschedule, __xen_send_IPI_mask
+           )
+        {
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+static inline int is_lock_spinning(struct vcpu *v)
+{
+    if ( (v->arch.user_regs.rip >= 0xffffffff810c4e30 && v->arch.user_regs.rip < 0xffffffff810c5040) // __pv_queued_spin_lock_slowpath
+         || (v->arch.user_regs.rip >= 0xffffffff817f6b80 && v->arch.user_regs.rip < 0xffffffff817f6bb0) // _raw_spin_lock
+         || (v->arch.user_regs.rip >= 0xffffffff817f6a20 && v->arch.user_regs.rip < 0xffffffff817f6a50) // _raw_spin_lock_irq
+         || (v->arch.user_regs.rip >= 0xffffffff817f6cf0 && v->arch.user_regs.rip < 0xffffffff817f6d30) // _raw_spin_lock_irqsave
+         || (v->arch.user_regs.rip >= 0xffffffff817f6bb0 && v->arch.user_regs.rip < 0xffffffff817f6be0) // _raw_spin_lock_bh
+         || (v->arch.user_regs.rip >= 0xffffffff810c4870 && v->arch.user_regs.rip < 0xffffffff810c4930) // osq_lock
+         || (v->arch.user_regs.rip >= 0xffffffff810c3fa0 && v->arch.user_regs.rip < 0xffffffff810c3ff0) // mutex_spin_on_owner.isra.4
+         || (v->arch.user_regs.rip >= 0xffffffff810c6140 && v->arch.user_regs.rip < 0xffffffff810c62c0) // rwsem_spin_on_owner, queued_{read,write}_lock_slowpath
+         || (v->arch.user_regs.rip >= 0xffffffff8118076f && v->arch.user_regs.rip < 0xffffffff8118077e) // queued_spin_lock_slowpath
+       )
+    {
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * Find an available cpu in the hidden pool
+ */
+static int find_hidden_cpu(void)
+{
+    bool_t find = 0;
+    unsigned int dest_cpu = cpumask_first(hidden_cpupool->cpu_valid);
+
+    if ( dest_cpu >= nr_cpu_ids )
+        return -1;
+
+    do
+    {
+        spinlock_t *lock = pcpu_schedule_trylock(dest_cpu);
+        struct scheduler *sched = per_cpu(scheduler, dest_cpu);
+
+        if ( !lock )
+        {
+            dest_cpu = cpumask_cycle(dest_cpu, hidden_cpupool->cpu_valid);
+            continue;
+        }
+
+        // finding idle hidden cpu
+        if ( is_idle_vcpu(SCHED_OP(sched, curr_vcpu, dest_cpu)) )
+        {
+            find = 1;
+            pcpu_schedule_unlock(lock, dest_cpu);
+            break;
+        }
+        pcpu_schedule_unlock(lock, dest_cpu);
+
+        dest_cpu = cpumask_cycle(dest_cpu, hidden_cpupool->cpu_valid);
+
+    } while ( dest_cpu != cpumask_first(hidden_cpupool->cpu_valid) );
+
+    if ( !find )
+    {
+        dest_cpu = cpumask_first(hidden_cpupool->cpu_valid);
+        if ( dest_cpu >= nr_cpu_ids )
+            return -1;
+
+        do
+        {
+            spinlock_t *lock = pcpu_schedule_trylock(dest_cpu);
+            struct scheduler *sched = per_cpu(scheduler, dest_cpu);
+
+            if ( !lock )
+            {
+                dest_cpu = cpumask_cycle(dest_cpu, hidden_cpupool->cpu_valid);
+                continue;
+            }
+
+            // finding idle runq among hidden cpus
+            if ( SCHED_OP(sched, check_runq, dest_cpu) )
+            {
+                find = 1;
+                pcpu_schedule_unlock(lock, dest_cpu);
+                break;
+            }
+            pcpu_schedule_unlock(lock, dest_cpu);
+
+            dest_cpu = cpumask_cycle(dest_cpu, hidden_cpupool->cpu_valid);
+
+        } while ( dest_cpu != cpumask_first(hidden_cpupool->cpu_valid) );
+    }
+
+    if ( find )
+        return dest_cpu;
+    else
+        return -1;
+}
+
+/*
+ * Try to offload vcpu siblings which are not currently running to hidden cpus
+ */
+static int sched_try_offload_siblings(struct domain *d)
+{
+    struct vcpu *v = current;
+    bool_t is_ipi = 0;
+    bool_t is_lock = 0;
+    bool_t do_yield = 0;
+    unsigned int dest_cpu;
+    unsigned int num_offloaded_vcpus = 0;
+    spinlock_t *lock;
+
+    spin_lock_irq(&d->offload_lock);
+    if ( d->on_offloading )
+    {
+        spin_unlock_irq(&d->offload_lock);
+        return 0;
+    }
+    else
+        d->on_offloading = 1;
+    spin_unlock_irq(&d->offload_lock);
+
+    /* xen_hypercall_sched_op (yield), smp_call_function_many */
+    if ( v->arch.user_regs.rip  == 0xffffffff810013a8 ||
+        (v->arch.user_regs.rip >= 0xffffffff810fc1d0 && v->arch.user_regs.rip < 0xffffffff810fc420) )
+    {
+        is_ipi = 1;
+        perfc_incr(vcpu_yield_ipi_many);
+    }
+    /* smp_call_function_single */
+    else if ( v->arch.user_regs.rip >= 0xffffffff810fbf60 && v->arch.user_regs.rip < 0xffffffff810fc070 )
+    {
+        is_ipi = 1;
+        do_yield = 1;
+        perfc_incr(vcpu_yield_ipi_single);
+        goto out;
+    }
+    else if ( is_lock_spinning(v) )
+    {
+        is_lock = 1;
+        perfc_incr(vcpu_yield_ple);
+    }
+    else if ( is_vcpu_halted(v) )
+    {
+        is_lock = 1;
+        do_yield = 1;
+        perfc_incr(vcpu_yield_hlt);
+    }
+    else
+    {
+        /* do not need to yield */
+        do_yield = 0;
+        perfc_incr(vcpu_yield_others);
+        goto out;
+    }
+
+
+    for_each_vcpu ( d, v )
+    {
+        lock = vcpu_schedule_lock_irq(v);
+
+        if ( v == current || v->is_running )
+        {
+            vcpu_schedule_unlock_irq(lock, v);
+            continue;
+        }
+        else if ( cpumask_test_cpu(v->processor, hidden_cpupool->cpu_valid) )
+        {
+            vcpu_schedule_unlock_irq(lock, v);
+            num_offloaded_vcpus++;
+            continue;
+        }
+
+#if 0
+        if ( is_lock && vcpu_runnable(v) && !is_urgent_kernel(v) && is_guest_kernel(v) && !is_vcpu_halted(v) && !is_lock_spinning(v) )
+            TRACE_3D(TRC_SCHED_RIP, v->domain->domain_id, v->vcpu_id, v->arch.user_regs.rip);
+#endif
+        if ( is_ipi || (is_lock && vcpu_runnable(v) && !v->yielded && is_urgent_kernel(v)) )
+        {
+            dest_cpu = find_hidden_cpu();
+
+            if ( dest_cpu == -1 )
+            {
+                vcpu_schedule_unlock_irq(lock, v);
+                perfc_incra(vcpu_offload_failed_no_hcpu, v->domain->domain_id);
+                break;
+            }
+
+            cpumask_set_cpu(dest_cpu, &hidden_locked_cpus);
+            set_bit(_VPF_migrating, &v->pause_flags);
+            vcpu_schedule_unlock_irq(lock, v);
+
+            vcpu_sleep_nosync(v);
+            if ( !vcpu_migrate_to_cpu(v, dest_cpu, 1) )
+            {
+                perfc_incra(vcpu_offload_failed_migration, v->domain->domain_id);
+                continue;
+            }
+
+            perfc_incra(vcpu_offload, v->domain->domain_id);
+            num_offloaded_vcpus++;
+
+            if ( is_lock )
+                break;
+        }
+        else
+            vcpu_schedule_unlock_irq(lock, v);
+    }
+
+out:
+    spin_lock_irq(&d->offload_lock);
+    d->on_offloading = 0;
+    spin_unlock_irq(&d->offload_lock);
+
+    if ( is_lock && (num_offloaded_vcpus == 0) )
+        do_yield = 1;
+
+    if ( do_yield )
+    {
+        v = current;
+        lock = vcpu_schedule_lock_irq(v);
+
+        SCHED_OP(VCPU2OP(v), yield, v);
+        vcpu_schedule_unlock_irq(lock, v);
+
+        raise_softirq(SCHEDULE_SOFTIRQ);
+    }
+
+    return 0;
+}
+
 /* Voluntarily yield the processor for this allocation. */
 long vcpu_yield(void)
 {
     struct vcpu * v=current;
-    spinlock_t *lock = vcpu_schedule_lock_irq(v);
 
-    SCHED_OP(VCPU2OP(v), yield, v);
-    vcpu_schedule_unlock_irq(lock, v);
+    if ( hidden_cpupool != NULL
+         && v->domain->domain_id != 0
+         && !is_idle_domain(v->domain)
+         && is_guest_kernel(v)
+         && !cpumask_test_cpu(v->processor, hidden_cpupool->cpu_valid) )
+    {
+        sched_try_offload_siblings(v->domain);
+    }
+    else
+    {
+        spinlock_t *lock = vcpu_schedule_lock_irq(v);
 
-    TRACE_2D(TRC_SCHED_YIELD, current->domain->domain_id, current->vcpu_id);
-    raise_softirq(SCHEDULE_SOFTIRQ);
+        SCHED_OP(VCPU2OP(v), yield, v);
+        vcpu_schedule_unlock_irq(lock, v);
+
+        TRACE_2D(TRC_SCHED_YIELD, current->domain->domain_id, current->vcpu_id);
+        raise_softirq(SCHEDULE_SOFTIRQ);
+    }
+
     return 0;
 }
 
@@ -1426,6 +1767,8 @@ static void schedule(void)
 
 void context_saved(struct vcpu *prev)
 {
+    spinlock_t *lock;
+
     /* Clear running flag /after/ writing context to memory. */
     smp_wmb();
 
@@ -1436,8 +1779,29 @@ void context_saved(struct vcpu *prev)
 
     SCHED_OP(VCPU2OP(prev), context_saved, prev);
 
-    if ( unlikely(prev->pause_flags & VPF_migrating) )
-        vcpu_migrate(prev);
+    /* In case we deschedule the vcpu which was running on a hidden cpu */
+    lock = vcpu_schedule_lock_irq(prev);
+    if ( hidden_cpupool != NULL
+         && cpumask_test_cpu(prev->processor, hidden_cpupool->cpu_valid)
+         && !is_idle_vcpu(prev)
+         && vcpu_runnable(prev) )
+    {
+        prev->need_boost = 0;
+        cpumask_clear_cpu(prev->processor, &hidden_locked_cpus);
+        set_bit(_VPF_migrating, &prev->pause_flags);
+        vcpu_schedule_unlock_irq(lock, prev);
+
+        perfc_incr(vcpu_turbo_end);
+
+        vcpu_sleep_nosync(prev);
+        vcpu_migrate_to_cpu(prev, prev->prev_processor, 0);
+    }
+    else
+    {
+        vcpu_schedule_unlock_irq(lock, prev);
+        if ( unlikely(prev->pause_flags & VPF_migrating) )
+            vcpu_migrate(prev);
+    }
 }
 
 /* The scheduler timer: force a run through the scheduler */
@@ -1664,6 +2028,7 @@ void __init scheduler_init(void)
     this_cpu(schedule_data).sched_priv = SCHED_OP(&ops, alloc_pdata, 0);
     BUG_ON(IS_ERR(this_cpu(schedule_data).sched_priv));
     SCHED_OP(&ops, init_pdata, this_cpu(schedule_data).sched_priv, 0);
+    cpumask_clear(&hidden_locked_cpus);
 }
 
 /*

@@ -23,6 +23,7 @@
 #define for_each_cpupool(ptr)    \
     for ((ptr) = &cpupool_list; *(ptr) != NULL; (ptr) = &((*(ptr))->next))
 
+struct cpupool *hidden_cpupool;          /* Hidden cpupool shortcut */
 struct cpupool *cpupool0;                /* Initial cpupool with Dom0 */
 cpumask_t cpupool_free_cpus;             /* cpus not in any cpupool */
 
@@ -129,7 +130,7 @@ void cpupool_put(struct cpupool *pool)
  * - unknown scheduler
  */
 static struct cpupool *cpupool_create(
-    int poolid, unsigned int sched_id, int *perr)
+    int poolid, unsigned int sched_id, uint8_t is_hidden, uint32_t parent_poolid, int *perr)
 {
     struct cpupool *c;
     struct cpupool **q;
@@ -165,13 +166,28 @@ static struct cpupool *cpupool_create(
     }
 
     c->cpupool_id = (poolid == CPUPOOLID_NONE) ? (last + 1) : poolid;
+    c->is_hidden = is_hidden;
     if ( poolid == 0 )
     {
         c->sched = scheduler_get_default();
     }
     else
     {
-        c->sched = scheduler_alloc(sched_id, perr);
+        if ( !is_hidden )
+            c->sched = scheduler_alloc(sched_id, perr);
+        else
+        {
+            struct cpupool **parent;
+            for_each_cpupool(parent)
+            {
+                if ( (*parent)->cpupool_id == parent_poolid )
+                {
+                    c->sched = (*parent)->sched;
+                    break;
+                }
+            }
+        }
+
         if ( c->sched == NULL )
         {
             spin_unlock(&cpupool_lock);
@@ -600,10 +616,13 @@ int cpupool_do_sysctl(struct xen_sysctl_cpupool_op *op)
 
         poolid = (op->cpupool_id == XEN_SYSCTL_CPUPOOL_PAR_ANY) ?
             CPUPOOLID_NONE: op->cpupool_id;
-        c = cpupool_create(poolid, op->sched_id, &ret);
+        c = cpupool_create(poolid, op->sched_id, op->is_hidden, op->parent_poolid, &ret);
         if ( c != NULL )
         {
             op->cpupool_id = c->cpupool_id;
+            c->is_hidden = op->is_hidden;
+            if ( c->is_hidden )
+                hidden_cpupool = c;
             cpupool_put(c);
         }
     }
@@ -615,6 +634,8 @@ int cpupool_do_sysctl(struct xen_sysctl_cpupool_op *op)
         ret = -ENOENT;
         if ( c == NULL )
             break;
+        if ( c->is_hidden )
+            hidden_cpupool = NULL;
         ret = cpupool_destroy(c);
         cpupool_put(c);
     }
@@ -655,6 +676,9 @@ int cpupool_do_sysctl(struct xen_sysctl_cpupool_op *op)
         if ( c == NULL )
             goto addcpu_out;
         ret = cpupool_assign_cpu_locked(c, cpu);
+        if ( c->is_hidden )
+            cpumask_set_cpu(cpu, hidden_cpupool->cpu_valid);
+
     addcpu_out:
         spin_unlock(&cpupool_lock);
         cpupool_dprintk("cpupool_assign_cpu(pool=%d,cpu=%d) ret %d\n",
@@ -674,6 +698,8 @@ int cpupool_do_sysctl(struct xen_sysctl_cpupool_op *op)
         if ( cpu == XEN_SYSCTL_CPUPOOL_PAR_ANY )
             cpu = cpumask_last(c->cpu_valid);
         ret = (cpu < nr_cpu_ids) ? cpupool_unassign_cpu(c, cpu) : -EINVAL;
+        if ( c->is_hidden )
+            cpumask_clear_cpu(cpu, hidden_cpupool->cpu_valid);
         cpupool_put(c);
     }
     break;
@@ -795,7 +821,7 @@ static int __init cpupool_presmp_init(void)
 {
     int err;
     void *cpu = (void *)(long)smp_processor_id();
-    cpupool0 = cpupool_create(0, 0, &err);
+    cpupool0 = cpupool_create(0, 0, 0, 0, &err);
     BUG_ON(cpupool0 == NULL);
     cpupool_put(cpupool0);
     cpu_callback(&cpu_nfb, CPU_ONLINE, cpu);

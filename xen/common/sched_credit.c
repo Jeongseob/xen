@@ -25,6 +25,9 @@
 #include <xen/trace.h>
 #include <xen/err.h>
 
+#define HCPU_TICK_US      100
+#define HCPU_TSLICE_US    100
+
 
 /*
  * Locking:
@@ -58,6 +61,7 @@
 /*
  * Priorities
  */
+#define CSCHED_PRI_TS_TURBO_BOOST      1
 #define CSCHED_PRI_TS_BOOST      0      /* time-share waking up */
 #define CSCHED_PRI_TS_UNDER     -1      /* time-share w/ credits */
 #define CSCHED_PRI_TS_OVER      -2      /* time-share w/o credits */
@@ -230,6 +234,7 @@ struct csched_private {
     /* Period of master and tick in milliseconds */
     unsigned tslice_ms, tick_period_us, ticks_per_tslice;
     unsigned credits_per_tslice;
+    bool_t is_dynamic;
 };
 
 static void csched_tick(void *_cpu);
@@ -294,6 +299,16 @@ __runq_remove(struct csched_vcpu *svc)
 {
     BUG_ON( !__vcpu_on_runq(svc) );
     list_del_init(&svc->runq_elem);
+}
+
+static int csched_check_runq(const struct scheduler *ops, int pcpu)
+{
+    return is_runq_idle(pcpu);
+}
+
+static struct vcpu * csched_vcpu_current(const struct scheduler *ops, int pcpu)
+{
+    return CSCHED_VCPU(curr_on_cpu(pcpu))->vcpu;
 }
 
 
@@ -382,6 +397,13 @@ static inline void __runq_tickle(struct csched_vcpu *new)
     online = cpupool_domain_cpumask(new->sdom->dom);
     cpumask_and(&idle_mask, prv->idlers, online);
     idlers_empty = cpumask_empty(&idle_mask);
+
+    if ( hidden_cpupool != NULL && cpumask_test_cpu(cpu, hidden_cpupool->cpu_valid) )
+    {
+        if ( is_idle_vcpu(curr_on_cpu(cpu)) )
+            cpu_raise_softirq(cpu, SCHEDULE_SOFTIRQ);
+        return;
+    }
 
     /*
      * If the pcpu is idle, or there are no idlers and the new
@@ -575,10 +597,14 @@ init_pdata(struct csched_private *prv, struct csched_pcpu *spc, int cpu)
         init_timer(&prv->master_ticker, csched_acct, prv, cpu);
         set_timer(&prv->master_ticker,
                   NOW() + MILLISECS(prv->tslice_ms));
+        prv->is_dynamic = 0;
     }
 
     init_timer(&spc->ticker, csched_tick, (void *)(unsigned long)cpu, cpu);
-    set_timer(&spc->ticker, NOW() + MICROSECS(prv->tick_period_us) );
+    if ( hidden_cpupool != NULL && cpumask_test_cpu(cpu, hidden_cpupool->cpu_valid) )
+        set_timer(&spc->ticker, NOW() + MICROSECS(HCPU_TICK_US) );
+    else
+        set_timer(&spc->ticker, NOW() + MICROSECS(prv->tick_period_us) );
 
     INIT_LIST_HEAD(&spc->runq);
     spc->runq_sort_last = prv->runq_sort;
@@ -964,7 +990,7 @@ csched_vcpu_acct(struct csched_private *prv, unsigned int cpu)
     {
         __csched_vcpu_acct_start(prv, svc);
     }
-    else
+    else if ( hidden_cpupool == NULL || (hidden_cpupool != NULL && !cpumask_test_cpu(cpu, hidden_cpupool->cpu_valid)) )
     {
         unsigned int new_cpu;
         unsigned long flags;
@@ -1133,14 +1159,27 @@ csched_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
      *  - VCPUs of capped domains unpausing after earning credits
      *    they had overspent.
      */
+    if ( svc->vcpu->need_boost &&
+         !test_bit(CSCHED_FLAG_VCPU_PARKED, &svc->flags) )
+    {
+        if ( svc->pri == CSCHED_PRI_TS_OVER )
+            perfc_incr(vcpu_turbo_on_over);
+        perfc_incr(vcpu_turbo_start);
+        svc->pri = CSCHED_PRI_TS_TURBO_BOOST;
+    }
+
     migrating = test_and_clear_bit(CSCHED_FLAG_VCPU_MIGRATING, &svc->flags);
 
     if ( !migrating && svc->pri == CSCHED_PRI_TS_UNDER &&
          !test_bit(CSCHED_FLAG_VCPU_PARKED, &svc->flags) )
     {
-        TRACE_2D(TRC_CSCHED_BOOST_START, vc->domain->domain_id, vc->vcpu_id);
-        SCHED_STAT_CRANK(vcpu_boost);
-        svc->pri = CSCHED_PRI_TS_BOOST;
+        if ( hidden_cpupool == NULL ||
+             (hidden_cpupool != NULL && !cpumask_test_cpu(vc->processor, hidden_cpupool->cpu_valid)) )
+        {
+            TRACE_2D(TRC_CSCHED_BOOST_START, vc->domain->domain_id, vc->vcpu_id);
+            SCHED_STAT_CRANK(vcpu_boost);
+            svc->pri = CSCHED_PRI_TS_BOOST;
+        }
     }
 
     /* Put the VCPU on the runq and tickle CPUs */
@@ -1155,6 +1194,15 @@ csched_vcpu_yield(const struct scheduler *ops, struct vcpu *vc)
 
     /* Let the scheduler know that this vcpu is trying to yield */
     set_bit(CSCHED_FLAG_VCPU_YIELD, &svc->flags);
+    vc->yielded = 1;
+}
+
+static int
+csched_is_vcpu_yield(const struct scheduler *ops, struct vcpu *vc)
+{
+    struct csched_vcpu * const svc = CSCHED_VCPU(vc);
+
+    return test_bit(CSCHED_FLAG_VCPU_YIELD, &svc->flags);
 }
 
 static int
@@ -1591,6 +1639,12 @@ csched_runq_steal(int peer_cpu, int cpu, int pri, int balance_step)
     struct list_head *iter;
     struct vcpu *vc;
 
+    if ( hidden_cpupool != NULL && cpumask_test_cpu(peer_cpu, hidden_cpupool->cpu_valid) )
+    {
+        printk(XENLOG_DEBUG "Do not steal a virtual CPU on the hidden cpu[%d]\n", peer_cpu);
+        return NULL;
+    }
+
     /*
      * Don't steal from an idle CPU's runq because it's about to
      * pick up work from it itself.
@@ -1722,6 +1776,14 @@ csched_load_balance(struct csched_private *prv, int cpu,
                     continue;
                 }
 
+                /* please do not steal vcpu in the hidden cpupool */
+                if ( hidden_cpupool != NULL && cpumask_test_cpu(peer_cpu, hidden_cpupool->cpu_valid) )
+                {
+                    pcpu_schedule_unlock(lock, peer_cpu);
+                    peer_cpu = cpumask_cycle(peer_cpu, &workers);
+                    continue;
+                }
+
                 /* Any work over there to steal? */
                 speer = cpumask_test_cpu(peer_cpu, online) ?
                     csched_runq_steal(peer_cpu, cpu, snext->pri, bstep) : NULL;
@@ -1802,6 +1864,9 @@ csched_schedule(
          && prv->ratelimit_us
          && vcpu_runnable(current)
          && !is_idle_vcpu(current)
+         && current->arch.user_regs.rip != 0xffffffff81061376
+         && !test_bit(CSCHED_FLAG_VCPU_YIELD, &scurr->flags)
+         && ( hidden_cpupool == NULL || !cpumask_test_cpu(cpu, hidden_cpupool->cpu_valid) )
          && runtime < MICROSECS(prv->ratelimit_us) )
     {
         snext = scurr;
@@ -1830,6 +1895,7 @@ csched_schedule(
         BUG_ON( is_idle_vcpu(current) || list_empty(runq) );
 
     snext = __runq_elem(runq->next);
+    snext->vcpu->yielded = 0;
     ret.migrated = 0;
 
     /* Tasklet work (which runs in idle VCPU context) overrides all else. */
@@ -1846,6 +1912,15 @@ csched_schedule(
     clear_bit(CSCHED_FLAG_VCPU_YIELD, &scurr->flags);
 
     /*
+     * Clear TURBO flag and return to the normal pool
+     */
+    if ( current->need_boost )
+    {
+        scurr->pri = CSCHED_PRI_TS_UNDER;
+        current->need_boost = 0;
+    }
+
+    /*
      * SMP Load balance:
      *
      * If the next highest priority local runnable VCPU has already eaten
@@ -1856,7 +1931,21 @@ csched_schedule(
     if ( snext->pri > CSCHED_PRI_TS_OVER )
         __runq_remove(snext);
     else
-        snext = csched_load_balance(prv, cpu, snext, &ret.migrated);
+    {
+        /*
+         * Do not call the load balance function on hidden cpus
+         */
+        if ( hidden_cpupool != NULL && cpumask_test_cpu(cpu, hidden_cpupool->cpu_valid) )
+        {
+            if ( snext->pri == CSCHED_PRI_TS_OVER )
+                perfc_incr(over_on_hidden);
+            else if ( snext->pri == CSCHED_PRI_IDLE )
+                perfc_incr(idle_on_hidden);
+            __runq_remove(snext);
+        }
+        else
+            snext = csched_load_balance(prv, cpu, snext, &ret.migrated);
+    }
 
     /*
      * Update idlers mask if necessary. When we're idling, other CPUs
@@ -1874,6 +1963,12 @@ csched_schedule(
 
     if ( !is_idle_vcpu(snext->vcpu) )
         snext->start_time += now;
+
+    /*
+     * NOTE: time slice is limited to the time of ratelimit
+     */
+    if ( hidden_cpupool != NULL && cpumask_test_cpu(cpu, hidden_cpupool->cpu_valid) )
+        tslice = MICROSECS(HCPU_TSLICE_US);
 
 out:
     /*
@@ -2161,6 +2256,10 @@ static const struct scheduler sched_credit_def = {
 
     .tick_suspend   = csched_tick_suspend,
     .tick_resume    = csched_tick_resume,
+
+    .curr_vcpu      = csched_vcpu_current,
+    .is_yield       = csched_is_vcpu_yield,
+    .check_runq     = csched_check_runq,
 };
 
 REGISTER_SCHEDULER(sched_credit_def);
