@@ -28,6 +28,9 @@
 #define HCPU_TICK_US      100
 #define HCPU_TSLICE_US    100
 
+#define HCPU_MANAGER_PROFILE_TICK_MS  10
+#define HCPU_MANAGER_TICK_MS  1000
+#define NUM_LIMIT_HIDDEN_CPUS   3
 
 /*
  * Locking:
@@ -234,11 +237,16 @@ struct csched_private {
     /* Period of master and tick in milliseconds */
     unsigned tslice_ms, tick_period_us, ticks_per_tslice;
     unsigned credits_per_tslice;
+    /* Keeping track of the num of events occured */
     bool_t is_dynamic;
+    bool_t profile_mode;
+    struct timer event_ticker;
+    struct sched_event_stat *stat_profile;
 };
 
 static void csched_tick(void *_cpu);
 static void csched_acct(void *dummy);
+static void csched_event_acct(void *dummy);
 
 static inline int
 __vcpu_on_runq(struct csched_vcpu *svc)
@@ -310,7 +318,6 @@ static struct vcpu * csched_vcpu_current(const struct scheduler *ops, int pcpu)
 {
     return CSCHED_VCPU(curr_on_cpu(pcpu))->vcpu;
 }
-
 
 #define for_each_csched_balance_step(step) \
     for ( (step) = 0; (step) <= CSCHED_BALANCE_HARD_AFFINITY; (step)++ )
@@ -559,10 +566,16 @@ csched_deinit_pdata(const struct scheduler *ops, void *pcpu, int cpu)
     {
         prv->master = cpumask_first(prv->cpus);
         migrate_timer(&prv->master_ticker, prv->master);
+        if ( prv->is_dynamic )
+            migrate_timer(&prv->event_ticker, prv->master);
     }
     kill_timer(&spc->ticker);
     if ( prv->ncpus == 0 )
+    {
         kill_timer(&prv->master_ticker);
+        if ( prv->is_dynamic )
+            kill_timer(&prv->event_ticker);
+    }
 
     spin_unlock_irqrestore(&prv->lock, flags);
 }
@@ -633,6 +646,20 @@ csched_init_pdata(const struct scheduler *ops, void *pdata, int cpu)
     spin_lock_irqsave(&prv->lock, flags);
     init_pdata(prv, pdata, cpu);
     spin_unlock_irqrestore(&prv->lock, flags);
+}
+
+static void
+csched_switch_dyn_hcpu(const struct scheduler *ops)
+{
+    struct csched_private *prv = CSCHED_PRIV(ops);
+
+    init_timer(&prv->event_ticker, csched_event_acct, prv, prv->master);
+    set_timer(&prv->event_ticker,
+            NOW() + MILLISECS(HCPU_MANAGER_PROFILE_TICK_MS));
+
+    prv->stat_profile = xzalloc_array(struct sched_event_stat, NUM_LIMIT_HIDDEN_CPUS + 1);
+    prv->is_dynamic = 1;
+    prv->profile_mode = 0;
 }
 
 /* Change the scheduler of cpu to us (Credit). */
@@ -1604,6 +1631,126 @@ out:
 }
 
 static void
+csched_event_acct(void* dummy)
+{
+    struct csched_private *prv = dummy;
+    struct domain *d;
+    unsigned cpu;
+    unsigned num_required_hidden_cpus = 1;
+    unsigned num_hidden_cpus;
+    s_time_t interval = MILLISECS(HCPU_MANAGER_PROFILE_TICK_MS);
+
+    for_each_domain( d )
+    {
+        if ( d->domain_id != 0 && !is_idle_domain(d) )
+            break;
+    }
+
+    if ( d == NULL || d->domain_id == 0 || is_idle_domain(d) )
+        goto out;
+
+    if ( !prv->profile_mode )
+    {
+        // set the number of hidden cpus to be zero
+        for_each_cpu( cpu, hidden_cpupool->cpu_valid )
+        {
+            if ( cpumask_test_cpu(cpu, &hidden_locked_cpus) ) continue;
+            cpumask_clear_cpu(cpu, hidden_cpupool->cpu_valid);
+            cpumask_set_cpu(cpu, d->cpupool->cpu_valid);
+        }
+        prv->profile_mode = 1;
+
+        goto out;
+    }
+
+    num_hidden_cpus = cpumask_weight(hidden_cpupool->cpu_valid);
+    BUG_ON ( num_hidden_cpus > NUM_LIMIT_HIDDEN_CPUS );
+
+    // keep track of records for the events
+    prv->stat_profile[num_hidden_cpus].num_ipi = urgent_stat->num_ipi;
+    prv->stat_profile[num_hidden_cpus].num_ple = urgent_stat->num_ple;
+
+    //printk("HCPU-%02d profile done (ipi: %ld, ple: %ld)\n", num_hidden_cpus, prv->stat_profile[num_hidden_cpus].num_ipi, prv->stat_profile[num_hidden_cpus].num_ple);
+
+    if ( num_hidden_cpus == NUM_LIMIT_HIDDEN_CPUS )
+    {
+        //num_required_hidden_cpus = 3; // Currently, it is hard coded.
+
+        int i;
+        uint64_t min_ipi = UINT_MAX;
+
+        for ( i = 1; i <= NUM_LIMIT_HIDDEN_CPUS; i++ )
+        {
+            if ( min_ipi > prv->stat_profile[i].num_ipi )
+            {
+                min_ipi = prv->stat_profile[i].num_ipi;
+                num_required_hidden_cpus = i;
+            }
+        }
+
+        interval = MILLISECS(HCPU_MANAGER_TICK_MS);
+        prv->profile_mode = 0;
+        perfc_incra(num_hcpus, num_required_hidden_cpus);
+        //printk("[%ld] IPI mode, hcpus: %d\n", NOW(), num_required_hidden_cpus);
+    }
+    else if ( num_hidden_cpus == 0 )
+    {
+        if ( prv->stat_profile[0].num_ipi == 0 && prv->stat_profile[0].num_ple == 0 )
+        {
+            num_required_hidden_cpus = 0;
+            interval = MILLISECS(HCPU_MANAGER_PROFILE_TICK_MS * 2);
+            prv->profile_mode = 0;
+            perfc_incra(num_hcpus, 0);
+            //printk("[%ld] HPCU-00 profile done (ipi: %ld, ple: %ld)\n", NOW(), prv->stat_profile[0].num_ipi, prv->stat_profile[0].num_ple);
+        }
+        else
+        {
+            num_required_hidden_cpus = 1;
+
+            for_each_cpu( cpu, d->cpupool->cpu_valid )
+            {
+                if ( cpu % 2 == 0 ) continue;
+
+                cpumask_clear_cpu(cpu, d->cpupool->cpu_valid);
+                cpumask_set_cpu(cpu, hidden_cpupool->cpu_valid);
+
+                num_required_hidden_cpus--;
+                if ( num_required_hidden_cpus == 0 ) break;
+            }
+
+            if ( prv->stat_profile[0].num_ple > prv->stat_profile[0].num_ipi)
+            {
+                interval = MILLISECS(HCPU_MANAGER_TICK_MS);
+                prv->profile_mode = 0;
+                perfc_incra(num_hcpus, 1);
+                //printk("[%ld] PLE mode, hcpus: 1\n", NOW());
+            }
+        }
+    }
+    else
+    {
+        num_required_hidden_cpus = 1;
+
+        for_each_cpu( cpu, d->cpupool->cpu_valid )
+        {
+            if ( cpu % 2 == 0 ) continue;
+
+            cpumask_clear_cpu(cpu, d->cpupool->cpu_valid);
+            cpumask_set_cpu(cpu, hidden_cpupool->cpu_valid);
+
+            num_required_hidden_cpus--;
+            if ( num_required_hidden_cpus == 0 ) break;
+        }
+    }
+
+out:
+    urgent_stat->num_ipi = 0;
+    urgent_stat->num_ple = 0;
+
+    set_timer( &prv->event_ticker, NOW() + interval);
+}
+
+static void
 csched_tick(void *_cpu)
 {
     unsigned int cpu = (unsigned long)_cpu;
@@ -1625,9 +1772,13 @@ csched_tick(void *_cpu)
      * modified priorities. This is a special O(n) sort and runs at most
      * once per accounting period (currently 30 milliseconds).
      */
-    csched_runq_sort(prv, cpu);
-
-    set_timer(&spc->ticker, NOW() + MICROSECS(prv->tick_period_us) );
+    if ( hidden_cpupool != NULL && cpumask_test_cpu(cpu, hidden_cpupool->cpu_valid) )
+        set_timer(&spc->ticker, NOW() + MICROSECS(HCPU_TICK_US) );
+    else
+    {
+        csched_runq_sort(prv, cpu);
+        set_timer(&spc->ticker, NOW() + MICROSECS(prv->tick_period_us) );
+    }
 }
 
 static struct csched_vcpu *
@@ -2253,6 +2404,7 @@ static const struct scheduler sched_credit_def = {
     .switch_sched   = csched_switch_sched,
     .alloc_domdata  = csched_alloc_domdata,
     .free_domdata   = csched_free_domdata,
+    .switch_dyn_hcpu = csched_switch_dyn_hcpu,
 
     .tick_suspend   = csched_tick_suspend,
     .tick_resume    = csched_tick_resume,

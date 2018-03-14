@@ -183,6 +183,7 @@ static struct cpupool *cpupool_create(
                 if ( (*parent)->cpupool_id == parent_poolid )
                 {
                     c->sched = (*parent)->sched;
+                    scheduler_enable_dyn_hcpu(c->sched);
                     break;
                 }
             }

@@ -10,6 +10,9 @@
 
 #include <xen/percpu.h>
 
+/* A global stat to record IPIs and PLEs */
+extern struct sched_event_stat *urgent_stat;
+
 /* A global pointer to the initial cpupool (POOL0). */
 extern struct cpupool *cpupool0;
 extern struct cpupool *hidden_cpupool;
@@ -143,6 +146,7 @@ struct scheduler {
     void         (*deinit_pdata)   (const struct scheduler *, void *, int);
     void         (*free_domdata)   (const struct scheduler *, void *);
     void *       (*alloc_domdata)  (const struct scheduler *, struct domain *);
+    void         (*switch_dyn_hcpu)    (const struct scheduler *);
 
     void         (*switch_sched)   (struct scheduler *, unsigned int,
                                     void *, void *);

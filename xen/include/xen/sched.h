@@ -820,6 +820,7 @@ struct scheduler;
 
 struct scheduler *scheduler_get_default(void);
 struct scheduler *scheduler_alloc(unsigned int sched_id, int *perr);
+void scheduler_enable_dyn_hcpu(struct scheduler *sched);
 void scheduler_free(struct scheduler *sched);
 int schedule_cpu_switch(unsigned int cpu, struct cpupool *c);
 void vcpu_force_reschedule(struct vcpu *v);
@@ -899,6 +900,11 @@ void schedule_dump(struct cpupool *c);
 extern void dump_runq(unsigned char key);
 
 void arch_do_physinfo(xen_sysctl_physinfo_t *pi);
+
+struct sched_event_stat {
+    uint64_t num_ipi;
+    uint64_t num_ple;
+};
 
 #endif /* __SCHED_H__ */
 

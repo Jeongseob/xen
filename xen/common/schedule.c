@@ -40,6 +40,8 @@
 #include <xen/err.h>
 
 cpumask_t hidden_locked_cpus;
+struct sched_event_stat *urgent_stat;
+
 /* opt_sched: scheduler - default to configured value */
 static char __initdata opt_sched[10] = CONFIG_SCHED_DEFAULT;
 string_param("sched", opt_sched);
@@ -1152,6 +1154,7 @@ static int sched_try_offload_siblings(struct domain *d)
     {
         is_ipi = 1;
         perfc_incr(vcpu_yield_ipi_many);
+        urgent_stat->num_ipi++;
     }
     /* smp_call_function_single */
     else if ( v->arch.user_regs.rip >= 0xffffffff810fbf60 && v->arch.user_regs.rip < 0xffffffff810fc070 )
@@ -1165,6 +1168,7 @@ static int sched_try_offload_siblings(struct domain *d)
     {
         is_lock = 1;
         perfc_incr(vcpu_yield_ple);
+        urgent_stat->num_ple++;
     }
     else if ( is_vcpu_halted(v) )
     {
@@ -2029,6 +2033,7 @@ void __init scheduler_init(void)
     BUG_ON(IS_ERR(this_cpu(schedule_data).sched_priv));
     SCHED_OP(&ops, init_pdata, this_cpu(schedule_data).sched_priv, 0);
     cpumask_clear(&hidden_locked_cpus);
+    urgent_stat = xzalloc(struct sched_event_stat);
 }
 
 /*
@@ -2154,6 +2159,11 @@ struct scheduler *scheduler_alloc(unsigned int sched_id, int *perr)
     }
 
     return sched;
+}
+
+void scheduler_enable_dyn_hcpu(struct scheduler *sched)
+{
+    SCHED_OP(sched, switch_dyn_hcpu);
 }
 
 void scheduler_free(struct scheduler *sched)
