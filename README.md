@@ -4,6 +4,7 @@
 
 ## Test machine
 Processor: Intel(R) Xeon(R) CPU E5645  @ 2.40GHz x 2
+
 Memory: 32GB per socket
 
 ~~~
@@ -38,7 +39,13 @@ hidden pool: ture
 parent pool id: 1
 ~~~
 
-If you would like to test with static micro-sliced cores (by the static-usliced-cores branch), then you need to manually configure the number of processors in the `Hidden-node`.  
+If you would like to test with static micro-sliced cores (by the static-usliced-cores branch), then you need to manually configure the number of processors in the `Hidden-node` via the cpupool commands such as `xl cpupool-cpu-add`.
+
+With the dyn-usliced-cores branch, you do not need to configure the number of cores in the `Hidden-node` pool. 
+
+## 2. Modifying (or updating) the critical symbols
+
+Our proposed technique takes advantage of the kernel symbol of guest virtual machines to interpret the instruction pointer of preempted or yielded virtual CPUs. So, you may want to change the `is_urgent_kernel()` in the xen/common/schedule.c file. At this moment, our implementation does not have a systematic mechanism to extract the critical OS services from the kernel symbols. We just hard code the part. (NEED to further update) 
 
  # Authors
  * Jeongseob Ahn
