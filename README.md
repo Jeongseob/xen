@@ -1,6 +1,11 @@
- # Accelerating Critical OS Services in Virtualized Systems with Flexible Micro-sliced Cores (EuroSys'18)
+# Accelerating Critical OS Services in Virtualized Systems with Flexible Micro-sliced Cores (EuroSys'18)
 
- We will release the Xen hypervisor code used for the EuroSys paper. (Comming soon)
+We have two branches for supporting micro-sliced cores witin the Xen code base.
+
+* static-usliced-cores: it is supposed to manually set the number of micro-sliced cores.
+* dyn-usliced-cores: it is used when the user (or administrator) would like to avoid the fixed micro-sliced cores.
+
+You can find our [paper](https://jeongseob.github.io/papers/ahn_eurosys18.pdf).
 
 ## Test machine
 Processor: Intel(R) Xeon(R) CPU E5645  @ 2.40GHz x 2
